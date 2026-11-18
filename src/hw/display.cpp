@@ -6,25 +6,24 @@
 #include <Adafruit_SSD1306.h>
 
 #include "config.h"
+#include "face_res.h"
 
 namespace {
 
-constexpr int kWidth = 128;
-constexpr int kHeight = 64;
-constexpr int kLeftEyeX = 40;
-constexpr int kRightEyeX = 88;
-constexpr int kEyeY = 27;
+// 在线探测周期：沿用改造前无屏时每 2 秒重试的节奏，不提高轮询频率。
+constexpr uint32_t kProbeIntervalMs = 2000;
 
-Adafruit_SSD1306 gDisplay(kWidth, kHeight, &Wire, -1);
+Adafruit_SSD1306 gDisplay(face_res::kFaceWidth, face_res::kFaceHeight, &Wire, -1);
 
-bool gReady = false;
+bool gReady = false;        // 在线且已完成初始化
+bool gPresentLast = false;  // 上一轮探测到的在线状态
 bool gWireStarted = false;
 bool gDirty = true;
-Mood gMood = Mood::Normal;
+Face gFace = Face::Normal;
 bool gBlinking = false;
 uint32_t gBlinkEndAt = 0;
 uint32_t gNextBlinkAt = 0;
-uint32_t gLastRetryAt = 0;
+uint32_t gLastProbeAt = 0;
 
 bool i2cPresent(uint8_t address)
 {
@@ -32,148 +31,89 @@ bool i2cPresent(uint8_t address)
     return Wire.endTransmission() == 0;
 }
 
-bool startDisplay()
+void ensureBus()
 {
-    if (!gWireStarted) {
-        Wire.setPins(cfg::kPinOledSda, cfg::kPinOledScl);
-        Wire.begin();
-        Wire.setClock(400000);  // 线长不稳时改成 100000
-        gWireStarted = true;
-    }
+    if (gWireStarted) return;
+    Wire.setPins(cfg::kPinOledSda, cfg::kPinOledScl);
+    Wire.begin();
+    Wire.setClock(400000);  // 线长不稳时改成 100000
+    gWireStarted = true;
+}
 
-    uint8_t address = 0;
-    if (i2cPresent(0x3C)) {
-        address = 0x3C;
-    } else if (i2cPresent(0x3D)) {
-        address = 0x3D;
-    } else {
-        return false;
-    }
+// 地址自动识别：0x3C 优先，失败再试 0x3D；都没有返回 0。
+uint8_t probeAddress()
+{
+    if (i2cPresent(0x3C)) return 0x3C;
+    if (i2cPresent(0x3D)) return 0x3D;
+    return 0;
+}
+
+// SSD1306 完整初始化。
+// 热插拔后屏幕常常停在「I²C 能应答、但显示输出已关闭」的状态，
+// 只探测地址不会点亮，必须重跑整套初始化命令（库内部含 0xAF 开显示），
+// 再清屏 + 显式开显示兜底，最后由 displayTick 按当前表情重绘一帧。
+bool fullInit(uint8_t address, bool reconnect)
+{
+    ensureBus();
 
     // 最后两个 false：不操作复位脚，也不要让库再次调用 Wire.begin()
     if (!gDisplay.begin(SSD1306_SWITCHCAPVCC, address, false, false)) {
         return false;
     }
-
+    gDisplay.ssd1306_command(SSD1306_DISPLAYON);
     gDisplay.clearDisplay();
     gDisplay.display();
+
     gReady = true;
     gDirty = true;
-    gNextBlinkAt = millis() + random(cfg::kBlinkIntervalMinMs, cfg::kBlinkIntervalMaxMs);
-    Serial.printf("[OLED] 就绪，地址 0x%02X\n", address);
+    gBlinking = false;
+    gNextBlinkAt =
+        millis() + random(cfg::kBlinkIntervalMinMs, cfg::kBlinkIntervalMaxMs);
+
+    if (reconnect) {
+        Serial.printf("[OLED] 检测到屏幕接入，自动初始化完成（地址 0x%02X）\n",
+                      address);
+    } else {
+        Serial.printf("[OLED] 就绪，地址 0x%02X\n", address);
+    }
     return true;
 }
 
-// ---------------------------- 绘图小工具 ----------------------------
+// ---------------------------- 表情位图 ----------------------------
 
-void drawRoundEye(int centerX, int centerY, int radius)
+bool hasBlinkFrame(Face face)
 {
-    gDisplay.fillCircle(centerX, centerY, radius, SSD1306_WHITE);
-    gDisplay.fillCircle(centerX, centerY, 3, SSD1306_BLACK);
-    gDisplay.fillCircle(centerX - 3, centerY - 3, 2, SSD1306_WHITE);
+    return face == Face::Normal || face == Face::Happy || face == Face::Confused;
 }
 
-void drawCheerfulEye(int centerX, int centerY)
+// 位图全部在 face_res.h，横向扫描 128×64，直接整屏贴图。
+const unsigned char *bitmapFor(Face face, bool blinking)
 {
-    gDisplay.drawLine(centerX - 10, centerY + 5, centerX, centerY - 5,
-                      SSD1306_WHITE);
-    gDisplay.drawLine(centerX, centerY - 5, centerX + 10, centerY + 5,
-                      SSD1306_WHITE);
+    switch (face) {
+        case Face::Happy:
+            return blinking ? face_res::face_happy_blink : face_res::face_happy;
+        case Face::Confused:
+            return blinking ? face_res::face_confused_blink
+                            : face_res::face_confused;
+        case Face::Heart:
+            return face_res::face_heart;
+        case Face::Listen:
+            return face_res::face_listen;
+        case Face::Speak:
+            return face_res::face_speak;
+        case Face::Sleep:
+            return face_res::face_sleep;
+        case Face::Normal:
+        default:
+            return blinking ? face_res::face_normal_blink : face_res::face_normal;
+    }
 }
 
-void drawClosedEye(int centerX, int centerY)
-{
-    gDisplay.drawLine(centerX - 10, centerY, centerX + 10, centerY,
-                      SSD1306_WHITE);
-    gDisplay.drawLine(centerX - 10, centerY + 1, centerX + 10, centerY + 1,
-                      SSD1306_WHITE);
-}
-
-void drawSmile(int topY)
-{
-    gDisplay.drawLine(44, topY, 52, topY + 6, SSD1306_WHITE);
-    gDisplay.drawLine(52, topY + 6, 64, topY + 8, SSD1306_WHITE);
-    gDisplay.drawLine(64, topY + 8, 76, topY + 6, SSD1306_WHITE);
-    gDisplay.drawLine(76, topY + 6, 84, topY, SSD1306_WHITE);
-}
-
-void drawFlatMouth(int y)
-{
-    gDisplay.drawRoundRect(52, y, 24, 5, 2, SSD1306_WHITE);
-}
-
-void drawWavyMouth(int y)
-{
-    gDisplay.drawLine(46, y + 2, 52, y, SSD1306_WHITE);
-    gDisplay.drawLine(52, y, 58, y + 4, SSD1306_WHITE);
-    gDisplay.drawLine(58, y + 4, 64, y, SSD1306_WHITE);
-    gDisplay.drawLine(64, y, 70, y + 4, SSD1306_WHITE);
-    gDisplay.drawLine(70, y + 4, 76, y, SSD1306_WHITE);
-    gDisplay.drawLine(76, y, 82, y + 2, SSD1306_WHITE);
-}
-
-void drawHeart(int centerX, int centerY, int size)
-{
-    const int lobe = size / 2;
-    gDisplay.fillCircle(centerX - lobe / 2, centerY - lobe / 2, lobe,
-                        SSD1306_WHITE);
-    gDisplay.fillCircle(centerX + lobe / 2, centerY - lobe / 2, lobe,
-                        SSD1306_WHITE);
-    gDisplay.fillTriangle(centerX - size, centerY - lobe / 3,
-                          centerX + size, centerY - lobe / 3,
-                          centerX, centerY + size, SSD1306_WHITE);
-}
-
-void drawFace(Mood mood, bool blinking)
+void drawFace(Face face, bool blinking)
 {
     gDisplay.clearDisplay();
-
-    if (blinking && mood != Mood::Heart) {
-        drawClosedEye(kLeftEyeX, kEyeY);
-        drawClosedEye(kRightEyeX, kEyeY);
-        switch (mood) {
-            case Mood::Happy:
-                drawSmile(40);
-                break;
-            case Mood::Confused:
-                drawWavyMouth(46);
-                break;
-            default:
-                drawFlatMouth(48);
-                break;
-        }
-        gDisplay.display();
-        return;
-    }
-
-    switch (mood) {
-        case Mood::Happy:
-            drawCheerfulEye(kLeftEyeX, kEyeY);
-            drawCheerfulEye(kRightEyeX, kEyeY);
-            drawSmile(40);
-            break;
-
-        case Mood::Confused:
-            drawRoundEye(kLeftEyeX, kEyeY, 8);
-            drawRoundEye(kRightEyeX + 2, kEyeY + 3, 5);
-            gDisplay.drawLine(78, 14, 100, 18, SSD1306_WHITE);  // 挑起的眉毛
-            drawWavyMouth(46);
-            break;
-
-        case Mood::Heart:
-            drawHeart(kLeftEyeX, kEyeY, 9);
-            drawHeart(kRightEyeX, kEyeY, 9);
-            drawSmile(42);
-            break;
-
-        case Mood::Normal:
-        default:
-            drawRoundEye(kLeftEyeX, kEyeY, 9);
-            drawRoundEye(kRightEyeX, kEyeY, 9);
-            drawFlatMouth(48);
-            break;
-    }
-
+    gDisplay.drawBitmap(0, 0, bitmapFor(face, blinking), face_res::kFaceWidth,
+                        face_res::kFaceHeight, SSD1306_WHITE);
     gDisplay.display();
 }
 
@@ -181,11 +121,17 @@ void drawFace(Mood mood, bool blinking)
 
 void displayInit()
 {
-    gLastRetryAt = millis();
-    if (!startDisplay()) {
-        Serial.println("[OLED] 未找到 0x3C/0x3D，检查 SDA=GPIO8、SCL=GPIO9、VCC=3V3");
-        Serial.println("[OLED] 会每 2 秒重试，舵机和传感器仍可正常工作");
+    gLastProbeAt = millis();
+
+    ensureBus();
+    const uint8_t address = probeAddress();
+    if (address != 0 && fullInit(address, false)) {
+        gPresentLast = true;
+        return;
     }
+
+    Serial.println("[OLED] 未找到 0x3C/0x3D，检查 SDA=GPIO8、SCL=GPIO9、VCC=3V3");
+    Serial.println("[OLED] 会每 2 秒重试，舵机和传感器仍可正常工作");
 }
 
 bool displayReady()
@@ -193,32 +139,76 @@ bool displayReady()
     return gReady;
 }
 
-void displaySetMood(Mood mood)
+void displaySetFace(Face face)
 {
-    if (mood != gMood) {
-        gMood = mood;
+    if (face != gFace) {
+        gFace = face;
         gDirty = true;
     }
 }
 
+void displaySetMood(Mood mood)
+{
+    switch (mood) {
+        case Mood::Happy:
+            displaySetFace(Face::Happy);
+            break;
+        case Mood::Confused:
+            displaySetFace(Face::Confused);
+            break;
+        case Mood::Heart:
+            displaySetFace(Face::Heart);
+            break;
+        case Mood::Normal:
+        default:
+            displaySetFace(Face::Normal);
+            break;
+    }
+}
+
+void displayTriggerBlink()
+{
+    // 爱心/聆听/说话/休眠没有眨眼帧，退回平静脸保证这次眨眼看得见
+    if (!hasBlinkFrame(gFace)) {
+        gFace = Face::Normal;
+    }
+    const uint32_t now = millis();
+    gBlinking = true;
+    gBlinkEndAt = now + cfg::kBlinkClosedMs;
+    gNextBlinkAt =
+        now + random(cfg::kBlinkIntervalMinMs, cfg::kBlinkIntervalMaxMs);
+    gDirty = true;
+}
+
 void displayTick(uint32_t now)
 {
-    if (!gReady) {
-        if (now - gLastRetryAt >= 2000) {
-            gLastRetryAt = now;
-            startDisplay();
+    // 1. 在线状态探测：每 2 秒一次，只在「离线 → 在线」跳变时完整重初始化。
+    if (now - gLastProbeAt >= kProbeIntervalMs) {
+        gLastProbeAt = now;
+        const uint8_t address = probeAddress();
+        const bool present = address != 0;
+
+        if (present && !gPresentLast) {
+            // 刚上线：重初始化失败则保持离线，下轮继续探测
+            gPresentLast = fullInit(address, true);
+        } else if (!present && gPresentLast) {
+            // 刚掉线：不操作显示对象，其他模块照常跑
+            gPresentLast = false;
+            gReady = false;
+            Serial.println("[OLED] 屏幕已断开，其他功能继续运行");
         }
-        if (!gReady) {
-            return;
-        }
+        // 在线保持期间不重复 begin()，避免刷屏、占用总线
     }
 
-    if (!gBlinking && gMood != Mood::Heart &&
-        (int32_t)(now - gNextBlinkAt) >= 0) {
+    if (!gReady) return;
+
+    // 2. 空闲自动眨眼（爱心/聆听/说话/休眠不眨眼，与改造前爱心脸的规则一致）
+    if (!gBlinking && hasBlinkFrame(gFace) && (int32_t)(now - gNextBlinkAt) >= 0) {
         gBlinking = true;
         gBlinkEndAt = now + cfg::kBlinkClosedMs;
         gDirty = true;
-        gNextBlinkAt = now + random(cfg::kBlinkIntervalMinMs, cfg::kBlinkIntervalMaxMs);
+        gNextBlinkAt =
+            now + random(cfg::kBlinkIntervalMinMs, cfg::kBlinkIntervalMaxMs);
     }
 
     if (gBlinking && (int32_t)(now - gBlinkEndAt) >= 0) {
@@ -226,8 +216,9 @@ void displayTick(uint32_t now)
         gDirty = true;
     }
 
+    // 3. 只在表情变化或眨眼时真正写屏
     if (gDirty) {
-        drawFace(gMood, gBlinking);
+        drawFace(gFace, gBlinking);
         gDirty = false;
     }
 }

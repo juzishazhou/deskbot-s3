@@ -2,7 +2,7 @@
 // 模块测试固件（不运行正式行为状态机）
 //
 // 用途：配合 tools/module-test.html 做分步硬件验收。
-//   01 OLED     face normal / happy / confused / heart
+//   01 OLED     face normal / happy / confused / heart / listen / speak / sleep
 //   02 红外     stream on 后观察 S 帧里的 irl/irr
 //   03 水平舵机  yaw 85 / yaw 95 / center / servotest
 //   04 俯仰舵机  pitch 85 / pitch 95 / center / servotest
@@ -89,7 +89,7 @@ void printStatus()
 void printHelp()
 {
     Serial.println("命令：help | status | stream on|off");
-    Serial.println("      face normal|happy|confused|heart");
+    Serial.println("      face normal|happy|confused|heart|listen|speak|sleep");
     Serial.println("      yaw <角度> | pitch <角度> | center");
     Serial.println("      servotest | stop");
 }
@@ -146,8 +146,15 @@ void handleCommand(char *line)
             displaySetMood(Mood::Confused);
         } else if (strcmp(arg, "heart") == 0) {
             displaySetMood(Mood::Heart);
+        } else if (strcmp(arg, "listen") == 0) {
+            displaySetFace(Face::Listen);
+        } else if (strcmp(arg, "speak") == 0) {
+            displaySetFace(Face::Speak);
+        } else if (strcmp(arg, "sleep") == 0) {
+            displaySetFace(Face::Sleep);
         } else {
-            Serial.println("ERR face 只支持 normal/happy/confused/heart");
+            Serial.println(
+                "ERR face 只支持 normal/happy/confused/heart/listen/speak/sleep");
             return;
         }
         Serial.printf("OK face=%s\n", arg);

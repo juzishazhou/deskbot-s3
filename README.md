@@ -1,19 +1,29 @@
 # DeskBot-S3
 
-基于 ESP32-S3-DevKitC-1（N16R8）的桌面表情机器人：一块 128×64 OLED 做脸，两只 SG90 控制头和俯仰，TTP223 触摸 + 左右红外做互动输入。
+基于 ESP32-S3-DevKitC-1（N16R8）的桌面表情机器人：一块 128×64 OLED 做脸，两只 SG90 控制水平和俯仰，TTP223 触摸 + 左右红外做互动输入，手机连热点即可远程控制。
 
-本项目参考了开源项目 [jaddele/DeskBot](https://github.com/jaddele/DeskBot) 的**分层思路**（纯逻辑状态机 + 可原生测试 + 硬件适配层），但代码是为 ESP32-S3 重新实现的。DeskBot 仓库未附带许可证，因此这里没有复制它的源文件。
+## 功能特性
 
-## 相比原版做了什么
-
-- **开发板迁移**：ESP32-WROOM-32 → ESP32-S3-DevKitC-1 N16R8；工程启用 16MB Flash、Octal PSRAM、16MB 分区表。
-- **引脚重排**：原版 GPIO12/13、21/22、4/5/18 在 S3 上不再适用；全部改为 S3 的安全引脚，并避开 Flash（26–32）、PSRAM（33–37）和 strapping 脚（0/3/45/46）。
+- **硬件平台**：ESP32-S3-DevKitC-1 N16R8，工程启用 16MB Flash、8MB Octal PSRAM 与 16MB 分区表。
+- **引脚规划**：全部使用 S3 安全引脚，避开 Flash（26–32）、PSRAM（33–37）和 strapping 脚（0/3/45/46）。
 - **触摸长按**：短按疑惑脸、按住 800ms 爱心眼；长按只在一次按住中触发一次。
 - **红外多数表决**：2ms 采样一次，5 次里至少 4 次有效才改变方向，降低阳光/反光误触发。
 - **触摸后红外重新接管规则**：松手后必须先出现一次完整的“无遮挡”窗口，旧遮挡才不会在 3 秒归中后立刻抢回控制权。
 - **舵机缓动**：目标角度按 50°/s（1°/20ms）变化，不会瞬间跳到极限位置。
 - **OLED 容错**：0x3C/0x3D 自动识别；没插屏时每 2 秒重试，机器人和串口仍然可用。
+- **OLED 热插拔自愈**：运行中每 2 秒探测一次，离线→在线的瞬间重新初始化并重绘当前表情，插拔屏幕不用重启。
+- **表情资源独立**：位图从 `display.cpp` 拆到 `src/face_res.h`，统一放在 PROGMEM；共 10 帧（normal/happy/confused/heart 各一张，另加眨眼与 listen/speak/sleep）。
+- **Wi-Fi 网页控制**：手机连热点 `Robot-Z`、打开 `http://192.168.4.1/`，就能切表情、点头、摇头、复位。
 - **有测试**：触摸消抖、长按边界、红外表决、行为优先级、归中计时、`millis()` 回绕、舵机限速都能在电脑上跑 Unity 测试。
+
+## 快速开始
+
+```bash
+pio run -t upload      # 编译并上传正式固件（UART 口）
+pio device monitor     # 查看串口日志
+```
+
+手机连接热点 `Robot-Z`（密码 `12345678`），浏览器打开 <http://192.168.4.1/> 即可控制表情与动作。
 
 ## 硬件
 
@@ -53,7 +63,50 @@
 7. 松手后必须先经历一次完整的“无遮挡”红外窗口，新的遮挡才允许重新跟随。
 8. 空闲时每 2.8–6.2 秒自动眨眼一次。
 
+## 手机网页控制
+
+开发板上电即开热点，不需要路由器，也不需要装 App：
+
+1. 手机 Wi-Fi 连接 **`Robot-Z`**，密码 **`12345678`**；
+2. 浏览器打开 **<http://192.168.4.1/>**（AP 固定 IP，串口开机日志也会打印）；
+3. 点按钮即可，按钮会有绿色闪烁 + 底部提示作为反馈。
+
+> 这个热点没有外网。部分 Android 机型会提示“网络不可用/是否继续使用”，选择继续即可。
+
+页面只有两个卡片：
+
+| 卡片 | 按钮 | 效果 |
+|---|---|---|
+| 表情 | 正常 / 开心 / 眨眼 | 平静脸 / 笑眼 / 立即眨一次 |
+| 动作 | 点头 / 摇头 / 复位 | 低头抬头一次 / 左右各摆一次 / 两轴回正中 |
+
+### HTTP 接口
+
+均为 `GET`，返回 JSON：成功 `{"ok":true,...}`，参数错误时 `400` + `{"ok":false,"error":"..."}`。
+
+| 路径 | 参数 | 说明 |
+|---|---|---|
+| `/` | — | 移动端控制页（内嵌 PROGMEM，单文件无外部依赖） |
+| `/api/face?type=normal` | `normal` / `happy` / `blink` | 调用 `displaySetMood()` 切表情；`blink` 调 `displayTriggerBlink()` 立即眨眼 |
+| `/api/action?do=nod` | `nod` / `shake` / `reset` | 点头 / 摇头 / 复位回中 |
+
+行为说明：
+
+- 网页动作不在 HTTP 回调里执行，只置一个待执行标志；主循环用**目标角度 + 1°/20ms 缓动**走完整个序列，全程没有阻塞式 `delay()`，串口、红外、触摸照常响应。
+- 每个序列都收在正中，结束后把舵机状态交还行为层，不会和红外跟随打架。
+- 动作执行中按一下触摸会立即中止并平滑回中（触摸优先级最高）。
+- 表情是共享的：网页选的表情会一直保持，直到行为层自己切换表情（例如红外触发开心、松手后疑惑）。也就是说“谁最后改谁说话”，不会每轮循环被覆盖。
+- 串口命令和触摸/红外交互都没有改动，网页只是多了一个入口。
+
 ## 编译与烧录
+
+工程有三个 `env`，用途不同（完整步骤见 [`docs/编译与烧录全流程.md`](docs/编译与烧录全流程.md)）：
+
+| env | 用途 | 命令 |
+|---|---|---|
+| `esp32-s3-devkitc-1` | 正式固件（默认 env，`pio run` 就是它） | `pio run -e esp32-s3-devkitc-1 -t upload` |
+| `module_test` | 分步硬件验收固件（无 Wi-Fi） | `pio run -e module_test -t upload` |
+| `native` | 电脑上的单元测试 | `pio test -e native` |
 
 ```bash
 # 编译
@@ -87,7 +140,7 @@ pio device monitor
 
 ```text
 help, status, stream on|off,
-face normal|happy|confused|heart,
+face normal|happy|confused|heart|listen|speak|sleep,
 yaw <角度>, pitch <角度>,
 center, servotest, stop
 ```
@@ -117,6 +170,8 @@ pio test -e native
 - 行为优先级、红外丢失保持与 3 秒归中、触摸等待、重新接管规则；
 - 舵机 1°/20ms 限速、限位、归中保持。
 
+`pio run -e native` 只做“native 环境能编能链”的自检（入口在 `src/native/stub_main.cpp`，跑测试时不会编译它），不涉及硬件。
+
 ## 调参
 
 所有硬件与行为参数都在 [`src/config.h`](src/config.h)：
@@ -136,9 +191,10 @@ pio test -e native
 
 ```text
 src/
-  main.cpp              正式固件：组装行为状态机与主循环
-  module_test.cpp       测试固件：串口命令与网页分步验收
+  main.cpp              正式固件：传感器采样、行为状态机与主循环装配
+  module_test.cpp       测试固件：串口命令分步验收（不含 Wi-Fi）
   config.h              引脚、电平、角度、时间参数
+  face_res.h            表情位图（1-bit PROGMEM，16 字节/行）
   logic/                纯 C++，不依赖 Arduino，可在电脑上测试
     filters.h/.cpp      触摸消抖/长按、红外多数表决
     behavior.h/.cpp     优先级状态机
@@ -146,7 +202,11 @@ src/
   hw/                   只做硬件适配
     sensors.*           GPIO 电平读取
     servos.*            Servo PWM 输出
-    display.*           OLED 初始化与表情动画
+    display.*           OLED 初始化、表情动画、热插拔自愈
+    webui.*             Wi-Fi 热点、HTTP 路由与内嵌控制页
+    action_player.*     网页动作序列（点头/摇头/复位，非阻塞）
+  native/
+    stub_main.cpp       native 环境的编译自检入口（跑测试时不参与）
 test/
   test_logic/           Unity 单元测试
 ```
@@ -161,7 +221,10 @@ test/
 | 转头/抬头方向相反 | 交换 `config.h` 里对应的两个角度，不要强扭摇臂 |
 | 触摸一直触发 | 把 `kTouchActiveHigh` 改成 `false` |
 | 红外一直触发 | 把 `kIrActiveLow` 改成 `false`，或检查 3.3V 供电 |
+| 手机搜不到热点 | 串口看是否打印 `[WEB] 热点启动失败`；AP 只在 2.4GHz 频段 |
+| 页面打不开 | 确认已连 `Robot-Z`、地址是 `http://192.168.4.1/`（不是 https）；关掉手机的移动数据代理再试 |
+| 页面按钮无反应 | 动作被执行中的触摸中止属于正常；若一直是“失败”，看串口日志确认服务已启动 |
 
-## 说明
+## 许可证
 
-DeskBot 原项目未声明开源许可证。本项目仅借鉴其架构与交互设计，代码为独立实现，并以 MIT 许可证发布（见 `LICENSE`）。
+本项目以 [MIT 许可证](LICENSE) 发布，Copyright (c) 2026 DeskBot-S3 contributors。
